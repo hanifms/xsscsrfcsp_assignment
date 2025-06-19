@@ -1,4 +1,4 @@
-# Laravel 12 Todo App - Security Implementation
+# Laravel Todo App - Security Implementation
 
 This Laravel 12 Todo application implements robust security measures to protect against common web vulnerabilities including Cross-Site Scripting (XSS), Cross-Site Request Forgery (CSRF), and implements Content Security Policy (CSP).
 
