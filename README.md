@@ -159,4 +159,7 @@ $middleware->web(\Spatie\Csp\AddCspHeaders::class);
   - Limits communication to approved domains only
   - Provides additional defense-in-depth against XSS
 
-p/s - with all these protections, the website is getting slower... like really slowwer. So if website lags or loads without styling just wait a bit
+p/s - with all these protections, the website is getting slower.. So if website lags or loads without styling just wait a bit
+
+https://github.com/user-attachments/assets/09b68a68-e7f2-4c9f-9e57-db5b8e8e1598
+
