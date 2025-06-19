@@ -158,3 +158,5 @@ $middleware->web(\Spatie\Csp\AddCspHeaders::class);
   - Prevents execution of unauthorized/inline scripts
   - Limits communication to approved domains only
   - Provides additional defense-in-depth against XSS
+
+p/s - with all these protections, the website is getting slower... like really slowwer. So if website lags or loads without styling just wait a bit
