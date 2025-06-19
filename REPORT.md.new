@@ -1,0 +1,641 @@
+# Laravel Authentication Enhancement Report
+
+This report documents the enhancements made to the Laravel authentication module of our Todo application.
+
+## 1. Strong Password Hashing
+
+- Laravel's default Bcrypt algorithm is being used for password hashing
+- Configuration set in `config/hashing.php` with `bcrypt` as the default driver
+- Automatic salting is handled internally by Laravel's hashing mechanism
+
+## 2. Multi-Factor Authentication (MFA)
+
+### 2.1 Email-Based MFA Implementation
+
+Created a custom email Mailable for sending 2FA codes:
+```php
+// app/Mail/TwoFactorAuthMail.php
+class TwoFactorAuthMail extends Mailable
+{
+    public $code;
+
+    public function __construct($code)
+    {
+        $this->code = $code;
+    }
+
+    public function envelope(): Envelope
+    {
+        return new Envelope(
+            subject: 'Your Two-Factor Authentication Code',
+        );
+    }
+
+    public function content(): Content
+    {
+        return new Content(
+            view: 'emails.auth.2fa-code',
+        );
+    }
+}
+```
+
+### 2.2 Custom Login Response
+
+```php
+// app/Http/Responses/LoginResponse.php
+public function toResponse($request)
+{
+    // The user is already authenticated here by Fortify
+    $user = Auth::user();
+
+    // 1. Generate a 6-digit code
+    $code = rand(100000, 999999);
+
+    // 2. Save code and expiry to the user
+    $user->update([
+        'two_factor_code' => $code,
+        'two_factor_expires_at' => now()->addMinutes(10),
+    ]);
+
+    // 3. Send the code via email
+    Mail::to($user->email)->send(new TwoFactorAuthMail($code));
+
+    // 4. Log the user out and redirect to verification page
+    Auth::logout();
+    $request->session()->put('login.id', $user->id);
+    return redirect()->route('2fa.challenge');
+}
+```
+
+### 2.3 Two-Factor Challenge Controller
+
+```php
+// app/Http/Controllers/Auth/TwoFactorChallengeController.php
+public function store(Request $request)
+{
+    $request->validate(['code' => 'required|string']);
+
+    $userId = $request->session()->get('login.id');
+    $user = User::find($userId);
+
+    if (!$user || $user->two_factor_code !== $request->code ||
+        $user->two_factor_expires_at->isPast()) {
+        return back()->withErrors(['code' => 'Invalid or expired code.']);
+    }
+
+    // Clear the 2FA data and log the user in
+    $user->update(['two_factor_code' => null, 'two_factor_expires_at' => null]);
+    Auth::login($user);
+    $request->session()->forget('login.id');
+
+    return redirect()->intended(config('fortify.home'));
+}
+```
+
+### 2.4 Two-Factor Management
+
+```php
+// app/Http/Controllers/TwoFactorController.php
+public function enableTwoFactor(Request $request)
+{
+    $user = $request->user();
+
+    // Validate password if needed
+    if (Features::optionEnabled(Features::twoFactorAuthentication(), 'confirmPassword')) {
+        $request->validate(['password' => ['required', 'string', 'current_password']]);
+    }
+
+    // Set placeholder values to indicate 2FA is enabled
+    $user->forceFill([
+        'two_factor_code' => 'ENABLED',
+        'two_factor_expires_at' => now()->addYears(10),
+    ])->save();
+
+    return back()->with('status', 'Two-factor authentication enabled successfully.');
+}
+```
+
+## 3. Rate Limiting for Login Attempts
+
+Implemented in `FortifyServiceProvider.php`:
+```php
+RateLimiter::for('login', function (Request $request) {
+    return Limit::perMinute(3)->by($request->ip())->response(function ($request, $headers) {
+        return response('Too many login attempts. Please try again in a minute.', 429)
+            ->withHeaders($headers);
+    });
+});
+```
+
+## 3. User Profile Management System
+
+This section details the comprehensive user profile management system implemented in the application.
+
+### 3.1 Enhanced User Model
+
+The User model has been extended with additional fields to support rich profile information:
+
+```php
+// database/migrations/2025_06_16_000000_add_profile_fields_to_users_table.php
+Schema::table('users', function (Blueprint $table) {
+    $table->string('nickname')->nullable()->after('name');
+    $table->string('avatar')->nullable()->after('nickname');
+    $table->string('phone')->nullable()->after('email');
+    $table->string('city')->nullable()->after('phone');
+});
+```
+
+### 3.2 Profile Management Implementation
+
+#### 3.2.1 Profile Controller Overview
+
+```php
+// app/Http/Controllers/ProfileController.php
+class ProfileController extends Controller
+{
+    public function update(Request $request)
+    {
+        $request->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'nickname' => ['required', 'string', 'max:255'],
+            'email' => ['required', 'string', 'email', 'max:255', 'unique:users,email,' . auth()->id()],
+            'phone' => ['nullable', 'string', 'max:20'],
+            'city' => ['nullable', 'string', 'max:100'],
+        ]);
+
+        auth()->user()->update($request->only(['name', 'nickname', 'email', 'phone', 'city']));
+    }
+
+    public function updateAvatar(Request $request)
+    {
+        $request->validate(['avatar' => ['required', 'image', 'max:2048']]);
+
+        $user = auth()->user();
+        if ($user->avatar) {
+            Storage::disk('public')->delete($user->avatar);
+        }
+
+        $avatarPath = $request->file('avatar')->store('avatars', 'public');
+        $user->update(['avatar' => $avatarPath]);
+    }
+
+    public function destroy(Request $request)
+    {
+        $request->validate(['password' => ['required', 'current_password']]);
+
+        $user = auth()->user();
+        if ($user->avatar) {
+            Storage::disk('public')->delete($user->avatar);
+        }
+
+        auth()->logout();
+        $user->delete();
+    }
+}
+```
+
+### 3.3 Profile View Implementation
+
+The profile view (`resources/views/profile/show.blade.php`) implements several key features:
+- Avatar management section
+- Personal information form
+- Password change form
+- Two-factor authentication controls
+- Account deletion form
+
+Each section provides appropriate validation and success messages:
+```blade
+<!-- Success messages display -->
+@if (session('status'))
+    <div class="alert alert-success">
+        {{ session('status') }}
+    </div>
+@endif
+```
+
+### 3.4 Profile Security Considerations
+
+- Password confirmation required for sensitive actions
+- CSRF protection on all forms
+- Input validation for all fields
+- Proper file validations for avatar uploads
+- Account deletion requires password confirmation
+
+## 4. Input Validation for Registration and Login Pages
+
+Form Request classes are used to implement robust input validation for registration and login forms, enhancing security and user experience.
+
+### 4.1 Form Request Implementation
+
+#### 4.1.1 Registration Form Validation
+
+```php
+// app/Http/Requests/RegisterRequest.php
+class RegisterRequest extends FormRequest
+{
+    public function authorize()
+    {
+        return true; // Open to public
+    }
+
+    public function rules()
+    {
+        return [
+            'name' => ['required', 'string', 'max:255', 'regex:/^[A-Za-z\s]+$/'],
+            'nickname' => ['required', 'string', 'max:255', 'regex:/^[A-Za-z0-9_\-]+$/'],
+            'email' => ['required', 'string', 'email', 'max:255', 'unique:users'],
+            'password' => [
+                'required', 'string', 'min:8', 'confirmed',
+                'regex:/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$/'
+            ],
+        ];
+    }
+
+    public function messages()
+    {
+        return [
+            'name.regex' => 'Name can only contain letters and spaces.',
+            'nickname.regex' => 'Nickname can only contain letters, numbers, underscores, and dashes.',
+            'password.regex' => 'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character.',
+        ];
+    }
+}
+```
+
+#### 4.1.2 Login Form Validation
+
+```php
+// app/Http/Requests/LoginRequest.php
+class LoginRequest extends FormRequest
+{
+    public function authorize()
+    {
+        return true; // Anyone can attempt to login
+    }
+
+    public function rules()
+    {
+        return [
+            'email' => [
+                'required', 'string', 'email', 'max:255',
+                'regex:/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/'
+            ],
+            'password' => ['required', 'string'],
+            'remember' => ['sometimes', 'boolean'],
+        ];
+    }
+
+    public function messages()
+    {
+        return [
+            'email.regex' => 'Please enter a valid email address.',
+        ];
+    }
+}
+```
+
+#### 4.1.3 Two-Factor Authentication Validation
+
+```php
+// app/Http/Requests/TwoFactorChallengeRequest.php
+class TwoFactorChallengeRequest extends FormRequest
+{
+    public function authorize()
+    {
+        return true; // Anyone with session ID can attempt 2FA
+    }
+
+    public function rules()
+    {
+        return [
+            'code' => ['required', 'string', 'regex:/^\d{6}$/'], // Exactly 6 digits
+        ];
+    }
+
+    public function messages()
+    {
+        return [
+            'code.regex' => 'The verification code must be exactly 6 digits.',
+        ];
+    }
+}
+```
+
+### 4.2 Controller Integration
+
+Form Request classes are integrated with controllers to provide validation:
+
+#### 4.2.1 Login Controller
+
+```php
+// app/Http/Controllers/Auth/LoginController.php (excerpt)
+public function login(LoginRequest $request)
+{
+    // Request is already validated by the LoginRequest class
+    $credentials = $request->only('email', 'password');
+    $remember = $request->filled('remember');
+
+    if (Auth::attempt($credentials, $remember)) {
+        $request->session()->regenerate();
+        return $this->sendLoginResponse($request);
+    }
+
+    return $this->sendFailedLoginResponse($request);
+}
+```
+
+#### 4.2.2 Two-Factor Challenge Controller
+
+```php
+// app/Http/Controllers/Auth/TwoFactorChallengeController.php (excerpt)
+public function store(TwoFactorChallengeRequest $request)
+{
+    // Request is already validated by TwoFactorChallengeRequest
+    $userId = $request->session()->get('login.id');
+    $user = User::find($userId);
+
+    if (!$user || $user->two_factor_code !== $request->code ||
+        $user->two_factor_expires_at->isPast()) {
+        return back()->withErrors(['code' => 'Invalid or expired code.']);
+    }
+
+    // Process valid 2FA code...
+}
+```
+
+### 4.3 Security Benefits
+
+1. **Input Whitelisting**: Using regex patterns ensures only permitted character formats can be submitted
+2. **Data Integrity**: Strict validation ensures database consistency
+3. **User Experience**: Clear, specific error messages help users correct their input
+4. **Security**: Prevents potential injection attacks through input validation
+5. **Maintainability**: Separating validation logic from controllers creates cleaner, more focused code
+
+### 4.4 Validation Strategy
+
+- **Whitelist Approach**: Only accepting known good input patterns
+- **Strict Type Checking**: Enforcing data types for all inputs
+- **Custom Error Messages**: Providing helpful feedback to users
+- **Dedicated Classes**: Separating validation logic from business logic
+
+This approach to input validation improves both security and user experience while maintaining clean, maintainable code architecture by keeping controllers focused on their primary responsibilities.
+
+## 5. Role-Based Access Control (RBAC) Implementation
+
+This section details the implementation of Role-Based Access Control (RBAC) in the application.
+
+### 5.1 Database Structure
+
+RBAC is implemented using two key tables:
+- `user_roles`: Links users to a specific role
+- `role_permissions`: Defines which permissions each role has
+
+The table structures are:
+
+```php
+// user_roles migration
+Schema::create('user_roles', function (Blueprint $table) {
+    $table->id('role_id');
+    $table->foreignId('user_id')->constrained()->onDelete('cascade');
+    $table->string('role_name');
+    $table->string('description')->nullable();
+    $table->timestamps();
+});
+
+// role_permissions migration
+Schema::create('role_permissions', function (Blueprint $table) {
+    $table->id('permission_id');
+    $table->foreignId('role_id')->constrained('user_roles', 'role_id')->onDelete('cascade');
+    $table->string('description'); // Create, Update, Delete, etc.
+    $table->timestamps();
+});
+```
+
+### 5.2 Authorization Middleware
+
+The application uses two key middleware components:
+
+```php
+// RoleMiddleware - Restricts access based on user role
+public function handle(Request $request, Closure $next, string $role)
+{
+    if (!Auth::user()->hasRole($role)) {
+        return redirect()->route('home')->with('error', 'Access denied.');
+    }
+    return $next($request);
+}
+
+// PermissionMiddleware - Restricts actions based on permissions
+public function handle(Request $request, Closure $next, $permission)
+{
+    if (!Auth::user()->hasPermission($permission)) {
+        return redirect()->back()->with('error', 'Permission denied.');
+    }
+    return $next($request);
+}
+```
+
+### 5.3 User Role Management
+
+Each user is assigned either an Administrator or User role with appropriate permissions:
+
+- **Administrator**: Full access (Create, Retrieve, Update, Delete)
+- **User**: Limited access (typically Create and Retrieve only)
+
+### 5.4 Permission-Based UI
+
+The UI elements adapt based on user permissions:
+
+```blade
+@if(Auth::user()->hasPermission('Create'))
+    <a href="{{ route('todo.create') }}" class="btn btn-primary">Add Todo</a>
+@endif
+```
+
+### 5.5 Admin Dashboard
+
+Administrators have access to:
+- User management (view all users)
+- User activation/deactivation
+- User deletion
+- Permission management for users
+- View todos created by any user
+
+### 5.6 Security Considerations
+
+- Routes are protected at the middleware level
+- UI elements are conditionally rendered based on permissions
+- Clear feedback is provided when permission is denied
+- Role and permission checks are performed on every protected action
+
+## 6. Web Security Enhancements
+
+This section details the comprehensive web security measures implemented to protect the application against common vulnerabilities.
+
+### 6.1 Cross-Site Scripting (XSS) Protection
+
+XSS protection is implemented through multiple defense layers:
+
+#### 6.1.1 Input Validation
+
+All user inputs are strictly validated using regex patterns to prevent injection of malicious scripts:
+
+```php
+// app/Http/Requests/TodoRequest.php
+public function rules()
+{
+    return [
+        'title' => ['required', 'string', 'max:255', 'regex:/^[A-Za-z0-9\s\.\,\-\_\'\"\!\?]+$/'],
+        'description' => ['nullable', 'string', 'regex:/^[A-Za-z0-9\s\.\,\-\_\'\"\!\?]+$/'],
+        // ...
+    ];
+}
+```
+
+#### 6.1.2 Automatic Output Escaping
+
+Laravel's Blade templating engine automatically escapes output to prevent script execution:
+
+```blade
+<!-- Safely displays user content by escaping HTML entities -->
+<p class="form-control-static">{{ $todo->title }}</p>
+<p class="form-control-static">{{ $todo->description }}</p>
+```
+
+#### 6.1.3 Contextual Encoding
+
+Different contexts (HTML, JavaScript, CSS) are handled appropriately to ensure proper encoding.
+
+### 6.2 Cross-Site Request Forgery (CSRF) Protection
+
+CSRF protection is implemented through multiple mechanisms:
+
+#### 6.2.1 CSRF Tokens
+
+All forms include CSRF tokens via the `@csrf` Blade directive:
+
+```blade
+<form method="POST" action="{{ route('todo.store') }}">
+    @csrf
+    <!-- Form fields -->
+</form>
+```
+
+#### 6.2.2 AJAX Request Protection
+
+JavaScript is configured to include CSRF tokens in all AJAX requests:
+
+```javascript
+// resources/js/bootstrap.js
+const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+if (csrfMeta) {
+    window.axios.defaults.headers.common['X-CSRF-TOKEN'] = csrfMeta.getAttribute('content');
+}
+```
+
+#### 6.2.3 SameSite Cookie Configuration
+
+Laravel's cookie settings use SameSite=lax to prevent CSRF attacks while maintaining usability:
+
+```php
+// config/session.php
+'same_site' => env('SESSION_SAME_SITE', 'lax'),
+```
+
+### 6.3 Content Security Policy (CSP) Implementation
+
+A Content Security Policy has been implemented to provide an additional layer of defense:
+
+#### 6.3.1 CSP Package Installation
+
+```bash
+composer require spatie/laravel-csp
+```
+
+#### 6.3.2 Custom Policy Definition
+
+```php
+// app/Policies/Csp/TodoAppCspPolicy.php
+public function configure()
+{
+    $this
+        // Base URI restriction
+        ->addDirective(Directive::BASE, 'self')
+
+        // Default sources restriction
+        ->addDirective(Directive::DEFAULT, 'self')
+
+        // Form submissions only to our domain
+        ->addDirective(Directive::FORM_ACTION, 'self')
+
+        // Images from our domain
+        ->addDirective(Directive::IMG, 'self')
+
+        // Disable plugins like Flash
+        ->addDirective(Directive::OBJECT, 'none')
+
+        // Scripts from our domain
+        ->addDirective(Directive::SCRIPT, 'self')
+
+        // Allow Font Awesome CDN and Google Fonts
+        ->addDirective(Directive::FONT, [
+            'self',
+            'https://cdnjs.cloudflare.com',
+            'https://fonts.gstatic.com',
+            'https://fonts.bunny.net'
+        ])
+
+        // Style sources
+        ->addDirective(Directive::STYLE, [
+            'self',
+            'https://cdnjs.cloudflare.com',
+            'https://fonts.googleapis.com',
+            'https://fonts.bunny.net'
+        ])
+
+        // Add nonce support for inline scripts
+        ->addNonceForDirective(Directive::SCRIPT);
+}
+```
+
+#### 6.3.3 CSP Middleware Registration
+
+CSP headers are added to all responses via middleware:
+
+```php
+// bootstrap/app.php
+->withMiddleware(function (Middleware $middleware): void {
+    // Register aliases for custom middleware
+    $middleware->alias([
+        'role' => \App\Http\Middleware\RoleMiddleware::class,
+        'permission' => \App\Http\Middleware\PermissionMiddleware::class,
+        'csp' => \Spatie\Csp\AddCspHeaders::class,
+    ]);
+
+    // Add CSP middleware to the web group
+    $middleware->web(\Spatie\Csp\AddCspHeaders::class);
+});
+```
+
+#### 6.3.4 CSP Configuration
+
+The policy is registered in the application configuration:
+
+```php
+// config/csp.php
+'policy' => \App\Policies\Csp\TodoAppCspPolicy::class,
+```
+
+### 6.4 Security Testing and Verification
+
+The security implementations have been tested against common attack vectors:
+
+1. XSS attacks using common payloads
+2. CSRF attacks by attempting cross-site form submissions
+3. Content injection via various input fields
+4. Verification of CSP headers in responses
+
+## TL;DR
+
+The Laravel Todo application has been enhanced with comprehensive security features at multiple layers. Authentication is secured through bcrypt hashing and email-based two-factor authentication. User access is controlled through a robust RBAC system that differentiates between administrators and regular users with granular permissions. The application is protected against web vulnerabilities with input validation using regex patterns, automatic output escaping in Blade templates, CSRF tokens in all forms and AJAX requests, and a Content Security Policy that restricts content sources. This multi-layered defense strategy provides defense-in-depth against common security threats while maintaining a clean, user-friendly interface.
